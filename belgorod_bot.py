@@ -22,9 +22,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "8807054442:AAHfRkSj6hI4Slwc_8qc3R48C4q1wOsk5uA"
-CHANNEL_ID = -1004314624597         # ID канала (с минусом)
-ADMIN_IDS = [898467551]              # Твой Telegram ID (можно несколько)
+BOT_TOKEN = "СЮДА_ТОКЕН"
+CHANNEL_ID = -100xxxxxxxxxx
+ADMIN_IDS = [123456789]
 
 CONFIG_FILE = Path("config.json")
 DEFAULT_CONFIG = {
@@ -190,7 +190,6 @@ def cancel_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")]
     ])
 
-# ================== ФИЛЬТР АДМИНА ==================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -257,9 +256,30 @@ async def send_weather(manual: bool = False):
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'<[^>]+>', '', text)
+
+    text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'www\.\S+', '', text)
+
+    junk_patterns = [
+        r'(?i)фото[:\s].*',
+        r'(?i)фотография[:\s].*',
+        r'(?i)изображение[:\s].*',
+        r'(?i)картинка[:\s].*',
+        r'(?i)image[:\s].*',
+        r'(?i)photo[:\s].*',
+        r'(?i)read more.*',
+        r'(?i)читать далее.*',
+        r'(?i)подробнее.*',
+        r'(?i)source:.*',
+        r'(?i)источник:.*',
+        r'\[.*?\]',
+        r'\(фото.*?\)',
+        r'\(Фото.*?\)',
+    ]
+    for pattern in junk_patterns:
+        text = re.sub(pattern, '', text)
+
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -284,10 +304,17 @@ async def fetch_and_send_news(force: bool = False):
                 if not title:
                     continue
 
-                if len(summary) > 800:
-                    summary = summary[:800] + "…"
+                # Убираем дублирование title в начале summary
+                if summary and summary.lower().startswith(title.lower()[:40]):
+                    summary = summary[len(title):].strip(" .–—-")
 
-                text = f"<b>{title}</b>\n\n{summary}" if summary else f"<b>{title}</b>"
+                if len(summary) > 700:
+                    summary = summary[:700].rsplit(' ', 1)[0] + "…"
+
+                if summary:
+                    text = f"<b>{title}</b>\n\n{summary}"
+                else:
+                    text = f"<b>{title}</b>"
 
                 try:
                     await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
@@ -543,7 +570,6 @@ async def admin_clear_errors(callback: CallbackQuery):
     await callback.answer("Логи очищены")
     await admin_errors(callback)
 
-# ================== СТАРТ ==================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if is_admin(message.from_user.id):
@@ -554,14 +580,11 @@ async def cmd_start(message: Message):
     else:
         await message.answer("Бот работает только в канале. Админ-команды недоступны.")
 
-# ================== ЗАПУСК ==================
 async def main():
     load_config()
     reschedule_jobs()
     scheduler.start()
-
     dp.include_router(admin_router)
-
     logger.info("Бот запущен")
     await dp.start_polling(bot)
 
