@@ -1,78 +1,156 @@
+#!/bin/bash
+
+# ========================================
+#  АВТОМАТИЧЕСКАЯ УСТАНОВКА (без вопросов)
+# ========================================
+
+# ========== ВАШИ ДАННЫЕ ==========
+BOT_TOKEN="8807054442:AAHfRkSj6hI4Slwc_8qc3R48C4q1wOsk5uA"
+CHANNEL_ID="-1004314624597"
+ADMIN_ID="898467551"
+OPENROUTER_KEY="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"
+AI_MODEL="deepseek/deepseek-r1:free"
+# ==================================
+
+set -e
+
+LOG_FILE="/root/bot_install_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "========================================"
+echo "  Belgorod News Bot — АВТОУСТАНОВКА"
+echo "  Лог: $LOG_FILE"
+echo "========================================"
+echo
+
+# Проверка root
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ Запусти от root: sudo ./install_auto.sh"
+  exit 1
+fi
+
+# Удаление старого
+echo "[1/6] Удаление старой версии..."
+systemctl stop belgorod-bot 2>/dev/null || true
+systemctl disable belgorod-bot 2>/dev/null || true
+rm -f /etc/systemd/system/belgorod-bot.service
+systemctl daemon-reload
+rm -rf /opt/Newspars
+echo "✅ Старое удалено"
+
+# Установка зависимостей
+echo "[2/6] Установка зависимостей..."
+apt update -y
+apt install -y python3 python3-pip python3-venv git curl
+
+# Создание директории
+INSTALL_DIR="/opt/Newspars"
+echo "[3/6] Создание бота в $INSTALL_DIR..."
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Виртуальное окружение
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install aiogram==3.4.1 httpx apscheduler
+
+# Создание bot.py (сокращённая версия)
+cat > bot.py << 'EOF'
 import asyncio
 import json
 import logging
 import re
-import traceback
-from datetime import datetime
+import random
+import string
+import signal
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Set
+from typing import Set, Dict, Optional, List
 
-import feedparser
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    FSInputFile, InputMediaPhoto
+)
 from aiogram.client.default import DefaultBotProperties
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-# ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "СЮДА_ТОКЕН"
-CHANNEL_ID = -100xxxxxxxxxx
-ADMIN_IDS = [123456789]
+BOT_TOKEN = "REPLACE_BOT_TOKEN"
+CHANNEL_ID = REPLACE_CHANNEL_ID
+ADMIN_IDS = [REPLACE_ADMIN_ID]
+OPENROUTER_API_KEY = "REPLACE_OPENROUTER_KEY"
+OPENROUTER_MODEL = "REPLACE_OPENROUTER_MODEL"
 
 CONFIG_FILE = Path("config.json")
+PENDING_FILE = Path("pending_news.json")
+SEEN_FILE = Path("seen_posts.json")
+PHOTO_CACHE_DIR = Path("photo_cache")
+PHOTO_CACHE_DIR.mkdir(exist_ok=True)
+
 DEFAULT_CONFIG = {
     "weather_enabled": True,
     "news_enabled": True,
+    "ai_enabled": bool(OPENROUTER_API_KEY and OPENROUTER_API_KEY != "REPLACE_OPENROUTER_KEY"),
+    "ai_model": OPENROUTER_MODEL if OPENROUTER_MODEL != "REPLACE_OPENROUTER_MODEL" else "deepseek/deepseek-r1:free",
+    "ai_temperature": 0.3,
     "weather_time": "08:00",
     "news_interval_minutes": 30,
-    "max_news_per_check": 5,
-    "rss_feeds": [
-        "https://belgorod.bezformata.com/rss.xml",
-        "https://openbelgorod.ru/feed",
+    "max_news_per_check": 3,
+    "tg_sources": [
+        {"name": "Губернатор Шуваев", "username": "shuvaev_aleksandr"},
+        {"name": "Оперштаб Белгород", "username": "operstab_bel"},
+        {"name": "Администрация Белгорода", "username": "beladm31"},
+        {"name": "Губернатор Белгородской области", "username": "gubernator_bel"},
+        {"name": "Правительство Белгородской области", "username": "belregion_ru"},
+        {"name": "МЧС Белгород", "username": "mchs_bel"},
+        {"name": "Минздрав Белгородской области", "username": "belzdrav31"},
     ],
-    "stats": {
-        "weather_sent": 0,
-        "news_sent": 0,
-        "last_weather": None,
-        "last_news_check": None,
-    },
-    "error_log": [],
+    "stats": {"weather_sent": 0, "news_sent": 0, "news_rejected": 0, "ai_processed": 0},
+    "lat": 50.6034,
+    "lon": 36.5809,
+    "city_name": "Белгород",
+    "max_pending_days": 7,
 }
 
-LAT, LON = 50.6034, 36.5809
-MAX_ERROR_LOG = 50
-
-# ================== ЛОГИРОВАНИЕ ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-admin_router = Router()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-
-sent_guids: Set[str] = set()
+seen_posts = {}
+sent_guids = set()
 config = {}
+pending_news = {}
+shutdown_event = asyncio.Event()
+http_client = None
 
-# ================== КОНФИГ ==================
+async def get_http_client():
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.AsyncClient(timeout=20, limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
+    return http_client
+
+async def close_http_client():
+    global http_client
+    if http_client and not http_client.is_closed:
+        await http_client.aclose()
+
 def load_config():
     global config
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE) as f:
             config = json.load(f)
         for k, v in DEFAULT_CONFIG.items():
             if k not in config:
@@ -80,513 +158,386 @@ def load_config():
     else:
         config = DEFAULT_CONFIG.copy()
         save_config()
-    return config
 
 def save_config():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-# ================== ЛОГИРОВАНИЕ ОШИБОК ==================
-def log_error(place: str, error: Exception | str, notify_admins: bool = True):
-    tb = traceback.format_exc() if isinstance(error, Exception) else ""
-    error_text = str(error)
+def load_seen():
+    global seen_posts
+    if SEEN_FILE.exists():
+        with open(SEEN_FILE) as f:
+            seen_posts = json.load(f)
+        seen_posts = {k: v for k, v in seen_posts.items() if v > (datetime.now() - timedelta(days=14)).isoformat()}
+        save_seen()
 
-    full_msg = f"[{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}] {place}: {error_text}"
-    if tb and "NoneType: None" not in tb:
-        full_msg += f"\n{tb}"
+def save_seen():
+    with open(SEEN_FILE, "w") as f:
+        json.dump(seen_posts, f, ensure_ascii=False, indent=2)
 
-    logger.error(full_msg)
+def is_seen(username, msg_id):
+    return f"{username}_{msg_id}" in seen_posts
 
-    entry = {
-        "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-        "place": place,
-        "error": error_text[:300],
-    }
-    config.setdefault("error_log", [])
-    config["error_log"].append(entry)
-    config["error_log"] = config["error_log"][-MAX_ERROR_LOG:]
-    save_config()
+def mark_seen(username, msg_id):
+    seen_posts[f"{username}_{msg_id}"] = datetime.now().isoformat()
+    save_seen()
 
-    if notify_admins:
-        asyncio.create_task(notify_admins_about_error(place, error_text))
+def load_pending():
+    global pending_news
+    if PENDING_FILE.exists():
+        with open(PENDING_FILE) as f:
+            data = json.load(f)
+        cutoff = (datetime.now() - timedelta(days=config.get("max_pending_days", 7))).isoformat()
+        pending_news = {k: v for k, v in data.items() if v.get("time", "") > cutoff}
+        save_pending()
 
-async def notify_admins_about_error(place: str, error_text: str):
-    text = (
-        f"⚠️ <b>Ошибка в боте</b>\n\n"
-        f"<b>Где:</b> {place}\n"
-        f"<b>Ошибка:</b> <code>{error_text[:400]}</code>\n\n"
-        f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>"
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception as e:
-            logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
+def save_pending():
+    with open(PENDING_FILE, "w") as f:
+        json.dump(pending_news, f, ensure_ascii=False, indent=2)
 
-# ================== FSM ==================
 class AdminStates(StatesGroup):
-    waiting_rss = State()
+    menu = State()
+    sources = State()
+    settings = State()
+    weather_menu = State()
+    system_menu = State()
+    geo_menu = State()
+    pending_menu = State()
+    del_source = State()
+    waiting_source_name = State()
+    waiting_source_username = State()
     waiting_weather_time = State()
     waiting_news_interval = State()
+    waiting_max_news = State()
+    waiting_lat = State()
+    waiting_lon = State()
+    waiting_city = State()
+    waiting_edit_text = State()
+    ai_settings = State()
+    waiting_ai_model = State()
+    waiting_ai_temp = State()
 
-# ================== КЛАВИАТУРЫ ==================
-def admin_main_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📰 Источники", callback_data="admin:sources"),
-        InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin:settings")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🌤 Отправить погоду", callback_data="admin:send_weather"),
-        InlineKeyboardButton(text="🔄 Проверить новости", callback_data="admin:force_news")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
-        InlineKeyboardButton(text="📋 Логи ошибок", callback_data="admin:errors")
-    )
-    builder.row(
-        InlineKeyboardButton(text="❌ Закрыть", callback_data="admin:close")
-    )
-    return builder.as_markup()
+def main_menu_kb():
+    b = ReplyKeyboardBuilder()
+    b.row(KeyboardButton(text="📰 Источники"), KeyboardButton(text="⚙️ Настройки"))
+    b.row(KeyboardButton(text="🌤 Погода"), KeyboardButton(text="🔄 Проверить новости"))
+    b.row(KeyboardButton(text="⏳ Модерация"), KeyboardButton(text="📊 Статистика"))
+    b.row(KeyboardButton(text="🔧 Система"), KeyboardButton(text="❌ Закрыть меню"))
+    return b.as_markup(resize_keyboard=True)
 
-def sources_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for i, url in enumerate(config["rss_feeds"]):
-        short = url.replace("https://", "").replace("http://", "")[:40]
-        builder.row(
-            InlineKeyboardButton(text=f"🗑 {short}", callback_data=f"admin:del_source:{i}")
-        )
-    builder.row(InlineKeyboardButton(text="➕ Добавить источник", callback_data="admin:add_source"))
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back"))
-    return builder.as_markup()
+def cancel_kb():
+    b = ReplyKeyboardBuilder()
+    b.row(KeyboardButton(text="❌ Отмена"))
+    return b.as_markup(resize_keyboard=True)
 
-def settings_kb() -> InlineKeyboardMarkup:
-    w_status = "✅" if config["weather_enabled"] else "❌"
-    n_status = "✅" if config["news_enabled"] else "❌"
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text=f"Погода: {w_status}", callback_data="admin:toggle_weather")
-    )
-    builder.row(
-        InlineKeyboardButton(text=f"Новости: {n_status}", callback_data="admin:toggle_news")
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text=f"⏰ Время погоды: {config['weather_time']}",
-            callback_data="admin:set_weather_time"
-        )
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text=f"🔄 Интервал новостей: {config['news_interval_minutes']} мин",
-            callback_data="admin:set_news_interval"
-        )
-    )
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back"))
-    return builder.as_markup()
-
-def cancel_kb() -> InlineKeyboardMarkup:
+def edit_kb(short_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")]
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{short_id}"),
+         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{short_id}")],
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{short_id}"),
+         InlineKeyboardButton(text="🤖 AI", callback_data=f"ai_rewrite:{short_id}")]
     ])
 
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# ================== ПОГОДА ==================
-async def get_weather() -> str:
+def generate_short_id():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+RSS_BRIDGE_INSTANCES = ["https://rss-bridge.org/bridge01", "https://rss-bridge.lewd.tech"]
+
+async def fetch_rss_bridge(username, instance):
     try:
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={LAT}&longitude={LON}"
-            f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-            f"weather_code,wind_speed_10m"
-            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum"
-            f"&timezone=Europe%2FMoscow&forecast_days=1"
-        )
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            data = r.json()
+        client = await get_http_client()
+        resp = await client.get(f"{instance}/?action=display&bridge=Telegram&username={username}&format=Json")
+        data = resp.json()
+        posts = []
+        for item in data.get("items", []):
+            msg_id = int(re.search(r'/(\d+)$', item.get("url", "")).group(1)) if re.search(r'/(\d+)$', item.get("url", "")) else 0
+            if not msg_id or is_seen(username, msg_id):
+                continue
+            text = re.sub(r'<[^>]+>', '', item.get("content_html", ""))
+            text = text.replace("VIEW IN TELEGRAM", "").strip()
+            if len(text) < 10:
+                mark_seen(username, msg_id)
+                continue
+            if any(w in text.lower() for w in ['погода', 'температура']):
+                mark_seen(username, msg_id)
+                continue
+            photos = re.findall(r'<img[^>]*data-src="([^"]+)"', item.get("content_html", ""))
+            posts.append({"id": f"{username}_{msg_id}", "text": text, "photos": photos[:3], "source": username, "link": item.get("url", ""), "msg_id": msg_id})
+            mark_seen(username, msg_id)
+            if len(posts) >= 3:
+                break
+        return posts
+    except:
+        return []
 
-        current = data["current"]
-        daily = data["daily"]
+async def fetch_all_tg_sources():
+    all_posts = []
+    for source in config.get("tg_sources", []):
+        for instance in RSS_BRIDGE_INSTANCES:
+            posts = await fetch_rss_bridge(source["username"], instance)
+            if posts:
+                for post in posts:
+                    post["source_name"] = source["name"]
+                all_posts.extend(posts)
+                break
+        await asyncio.sleep(0.5)
+    return all_posts
 
-        codes = {
-            0: "☀️ Ясно", 1: "🌤 Преимущественно ясно", 2: "⛅ Переменная облачность",
-            3: "☁️ Пасмурно", 45: "🌫 Туман", 48: "🌫 Изморозь",
-            51: "🌦 Морось", 61: "🌧 Небольшой дождь", 63: "🌧 Дождь",
-            65: "🌧 Сильный дождь", 71: "❄️ Небольшой снег", 73: "❄️ Снег",
-            75: "❄️ Сильный снег", 80: "🌦 Ливень", 95: "⛈ Гроза",
-        }
-        desc = codes.get(current["weather_code"], "Неизвестно")
-
-        return (
-            f"<b>🌤 Погода в Белгороде на сегодня</b>\n"
-            f"────────────────\n"
-            f"{desc}\n"
-            f"🌡 Сейчас: <b>{current['temperature_2m']}°C</b> "
-            f"(ощущается как {current['apparent_temperature']}°C)\n"
-            f"📈 Макс: {daily['temperature_2m_max'][0]}°C  "
-            f"📉 Мин: {daily['temperature_2m_min'][0]}°C\n"
-            f"💧 Влажность: {current['relative_humidity_2m']}%\n"
-            f"💨 Ветер: {current['wind_speed_10m']} м/с\n"
-            f"🌧 Осадки за день: {daily['precipitation_sum'][0]} мм\n"
-            f"────────────────\n"
-            f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>"
-        )
-    except Exception as e:
-        log_error("get_weather", e)
-        raise
-
-async def send_weather(manual: bool = False):
-    if not config["weather_enabled"] and not manual:
-        return
+async def get_weather():
     try:
-        text = await get_weather()
-        await bot.send_message(CHANNEL_ID, text)
-        config["stats"]["weather_sent"] += 1
-        config["stats"]["last_weather"] = datetime.now().strftime("%d.%m.%Y %H:%M")
-        save_config()
-        logger.info("Погода отправлена")
-    except Exception as e:
-        log_error("send_weather", e)
+        client = await get_http_client()
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={config.get('lat',50.6034)}&longitude={config.get('lon',36.5809)}&current=temperature_2m,weather_code&timezone=Europe/Moscow"
+        data = (await client.get(url)).json()
+        cur = data["current"]
+        codes = {0: ("☀️", "Ясно"), 1: ("🌤", "Облачно"), 3: ("☁️", "Пасмурно"), 61: ("🌧", "Дождь")}
+        emoji, desc = codes.get(cur.get("weather_code", 0), ("❓", "Неизвестно"))
+        return f"<b>🌤 Погода в {config.get('city_name','Белгород')}е</b>\n\n{emoji} {desc}\n<b>Температура:</b> {cur.get('temperature_2m',0):.1f}°C"
+    except:
+        return "⚠️ Погода недоступна"
 
-# ================== НОВОСТИ ==================
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'www\.\S+', '', text)
-
-    junk_patterns = [
-        r'(?i)фото[:\s].*',
-        r'(?i)фотография[:\s].*',
-        r'(?i)изображение[:\s].*',
-        r'(?i)картинка[:\s].*',
-        r'(?i)image[:\s].*',
-        r'(?i)photo[:\s].*',
-        r'(?i)read more.*',
-        r'(?i)читать далее.*',
-        r'(?i)подробнее.*',
-        r'(?i)source:.*',
-        r'(?i)источник:.*',
-        r'\[.*?\]',
-        r'\(фото.*?\)',
-        r'\(Фото.*?\)',
-    ]
-    for pattern in junk_patterns:
-        text = re.sub(pattern, '', text)
-
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-async def fetch_and_send_news(force: bool = False):
-    if not config["news_enabled"] and not force:
+async def send_weather(manual=False):
+    if not config.get("weather_enabled", True) and not manual:
         return
-
-    global sent_guids
-    new_posts = 0
-
-    for feed_url in config["rss_feeds"]:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:config["max_news_per_check"]]:
-                guid = entry.get("id") or entry.get("link") or entry.get("title")
-                if not guid or guid in sent_guids:
-                    continue
-
-                title = clean_text(entry.get("title", ""))
-                summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-
-                if not title:
-                    continue
-
-                # Убираем дублирование title в начале summary
-                if summary and summary.lower().startswith(title.lower()[:40]):
-                    summary = summary[len(title):].strip(" .–—-")
-
-                if len(summary) > 700:
-                    summary = summary[:700].rsplit(' ', 1)[0] + "…"
-
-                if summary:
-                    text = f"<b>{title}</b>\n\n{summary}"
-                else:
-                    text = f"<b>{title}</b>"
-
-                try:
-                    await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
-                    sent_guids.add(guid)
-                    new_posts += 1
-                    await asyncio.sleep(1.2)
-                except Exception as e:
-                    log_error(f"send_news ({feed_url[:40]})", e)
-
-        except Exception as e:
-            log_error(f"RSS parse ({feed_url[:50]})", e)
-
-    config["stats"]["news_sent"] += new_posts
-    config["stats"]["last_news_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    await bot.send_message(CHANNEL_ID, await get_weather(), parse_mode="HTML")
+    config["stats"]["weather_sent"] = config["stats"].get("weather_sent", 0) + 1
     save_config()
 
-    if new_posts:
-        logger.info(f"Отправлено новостей: {new_posts}")
+async def download_photo(url):
+    if not url:
+        return None
+    try:
+        filename = f"photo_{abs(hash(url)) % 100000000:09d}.jpg"
+        path = PHOTO_CACHE_DIR / filename
+        if path.exists():
+            return str(path)
+        client = await get_http_client()
+        resp = await client.get(url)
+        with open(path, "wb") as f:
+            f.write(resp.content)
+        return str(path)
+    except:
+        return None
 
-    if len(sent_guids) > 500:
-        sent_guids = set(list(sent_guids)[-300:])
+async def send_to_moderation(post):
+    text = post.get("text", "")
+    source_name = post.get("source_name", "")
+    short_id = generate_short_id()
+    photo_paths = []
+    for url in post.get("photos", [])[:3]:
+        path = await download_photo(url)
+        if path:
+            photo_paths.append(path)
+    
+    full_text = f"📰 <b>{source_name}</b>\n\n{text[:3500]}" if source_name else text[:3500]
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            if len(photo_paths) > 1:
+                media = [InputMediaPhoto(media=FSInputFile(p), caption=full_text[:4000] if i==0 else "") for i, p in enumerate(photo_paths)]
+                await bot.send_media_group(admin_id, media=media)
+                await bot.send_message(admin_id, f"👆 {source_name}", reply_markup=edit_kb(short_id))
+            elif len(photo_paths) == 1:
+                await bot.send_photo(admin_id, photo=FSInputFile(photo_paths[0]), caption=full_text[:4000], reply_markup=edit_kb(short_id))
+            else:
+                await bot.send_message(admin_id, full_text, reply_markup=edit_kb(short_id))
+            
+            pending_news[short_id] = {"guid": post["id"], "text": text, "photos": photo_paths, "source": source_name, "link": post.get("link",""), "time": datetime.now().isoformat()}
+            save_pending()
+            return short_id
+        except:
+            continue
+    return None
 
-# ================== ПЛАНИРОВЩИК ==================
+async def approve_news(short_id):
+    if short_id not in pending_news:
+        return False
+    item = pending_news[short_id]
+    try:
+        text = item.get("text", "")[:3500]
+        if item.get("source"):
+            text += f"\n\n— {item['source']}"
+        if item.get("photos"):
+            await bot.send_photo(CHANNEL_ID, photo=FSInputFile(item["photos"][0]), caption=text[:4000])
+        else:
+            await bot.send_message(CHANNEL_ID, text[:4000])
+        sent_guids.add(item["guid"])
+        config["stats"]["news_sent"] = config["stats"].get("news_sent", 0) + 1
+        save_config()
+        for path in item.get("photos", []):
+            if path and os.path.exists(path):
+                os.remove(path)
+        del pending_news[short_id]
+        save_pending()
+        return True
+    except:
+        return False
+
+async def reject_news(short_id):
+    if short_id not in pending_news:
+        return False
+    item = pending_news.pop(short_id)
+    save_pending()
+    for path in item.get("photos", []):
+        if path and os.path.exists(path):
+            os.remove(path)
+    config["stats"]["news_rejected"] = config["stats"].get("news_rejected", 0) + 1
+    save_config()
+    return True
+
+async def fetch_and_send_news(force=False):
+    if not config.get("news_enabled", True) and not force:
+        return 0
+    posts = await fetch_all_tg_sources()
+    count = 0
+    for post in posts[:config.get("max_news_per_check", 3)]:
+        if post["id"] not in sent_guids and await send_to_moderation(post):
+            count += 1
+            await asyncio.sleep(0.5)
+    return count
+
 def reschedule_jobs():
     scheduler.remove_all_jobs()
-
-    if config["weather_enabled"]:
+    if config.get("weather_enabled", True):
         h, m = map(int, config["weather_time"].split(":"))
         scheduler.add_job(send_weather, CronTrigger(hour=h, minute=m), id="weather")
+    if config.get("news_enabled", True):
+        scheduler.add_job(fetch_and_send_news, IntervalTrigger(minutes=config.get("news_interval_minutes", 30)), id="news")
 
-    if config["news_enabled"]:
-        scheduler.add_job(
-            fetch_and_send_news,
-            IntervalTrigger(minutes=config["news_interval_minutes"]),
-            id="news"
-        )
-
-# ================== АДМИН ХЕНДЛЕРЫ ==================
-@admin_router.message(Command("admin"))
-async def cmd_admin(message: Message):
+# Маршруты
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        return await message.answer("⛔ Нет доступа")
+        return
+    await state.set_state(AdminStates.menu)
+    await message.answer("🛠 Админ-панель", reply_markup=main_menu_kb())
+
+@dp.callback_query(F.data.startswith("approve:"))
+async def mod_approve(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("⛔ Нет доступа")
+    if await approve_news(callback.data.split(":")[-1]):
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply("✅ Одобрено")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("reject:"))
+async def mod_reject(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("⛔ Нет доступа")
+    if await reject_news(callback.data.split(":")[-1]):
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply("❌ Отклонено")
+    await callback.answer()
+
+@dp.message(F.text == "🔄 Проверить новости")
+async def menu_force_news(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🔍 Проверяю...")
+    count = await fetch_and_send_news(force=True)
+    await message.answer(f"✅ Найдено {count} новостей" if count else "✅ Новых нет", reply_markup=main_menu_kb())
+
+@dp.message(F.text == "📊 Статистика")
+async def menu_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    stats = config.get("stats", {})
     await message.answer(
-        "<b>🛠 Админ-панель</b>\nВыбери действие:",
-        reply_markup=admin_main_kb()
+        f"📊 Статистика\n\n"
+        f"🌤 Погода: {stats.get('weather_sent', 0)}\n"
+        f"📰 Опубликовано: {stats.get('news_sent', 0)}\n"
+        f"❌ Отклонено: {stats.get('news_rejected', 0)}\n"
+        f"🤖 AI: {stats.get('ai_processed', 0)}\n"
+        f"⏳ В очереди: {len(pending_news)}",
+        reply_markup=main_menu_kb()
     )
 
-@admin_router.callback_query(F.data == "admin:back")
-async def admin_back(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        "<b>🛠 Админ-панель</b>\nВыбери действие:",
-        reply_markup=admin_main_kb()
-    )
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:close")
-async def admin_close(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.delete()
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:cancel")
-async def admin_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        "<b>🛠 Админ-панель</b>\nВыбери действие:",
-        reply_markup=admin_main_kb()
-    )
-    await callback.answer("Отменено")
-
-@admin_router.callback_query(F.data == "admin:sources")
-async def admin_sources(callback: CallbackQuery):
-    text = "<b>📰 Источники новостей</b>\n\n"
-    if config["rss_feeds"]:
-        for i, url in enumerate(config["rss_feeds"], 1):
-            text += f"{i}. <code>{url}</code>\n"
-    else:
-        text += "<i>Источников нет</i>\n"
-    await callback.message.edit_text(text, reply_markup=sources_kb())
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:add_source")
-async def admin_add_source(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_rss)
-    await callback.message.edit_text(
-        "Отправь ссылку на RSS-ленту:\n\nПример: <code>https://example.com/rss.xml</code>",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-@admin_router.message(AdminStates.waiting_rss)
-async def process_add_rss(message: Message, state: FSMContext):
+@dp.message(F.text == "❌ Закрыть меню")
+async def menu_close(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    url = message.text.strip()
-    if not url.startswith("http"):
-        return await message.answer("Некорректная ссылка. Попробуй ещё раз или нажми Отмена.")
-
-    if url in config["rss_feeds"]:
-        return await message.answer("Этот источник уже добавлен.")
-
-    config["rss_feeds"].append(url)
-    save_config()
     await state.clear()
-    await message.answer(f"✅ Источник добавлен:\n<code>{url}</code>")
-    await message.answer("<b>📰 Источники новостей</b>", reply_markup=sources_kb())
+    await message.answer("Меню закрыто", reply_markup=ReplyKeyboardRemove())
 
-@admin_router.callback_query(F.data.startswith("admin:del_source:"))
-async def admin_del_source(callback: CallbackQuery):
-    idx = int(callback.data.split(":")[-1])
-    if 0 <= idx < len(config["rss_feeds"]):
-        removed = config["rss_feeds"].pop(idx)
-        save_config()
-        await callback.answer(f"Удалён: {removed[:30]}...")
-    await admin_sources(callback)
-
-@admin_router.callback_query(F.data == "admin:settings")
-async def admin_settings(callback: CallbackQuery):
-    await callback.message.edit_text("<b>⚙️ Настройки</b>", reply_markup=settings_kb())
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:toggle_weather")
-async def toggle_weather(callback: CallbackQuery):
-    config["weather_enabled"] = not config["weather_enabled"]
-    save_config()
-    reschedule_jobs()
-    await callback.answer(f"Погода {'включена' if config['weather_enabled'] else 'выключена'}")
-    await admin_settings(callback)
-
-@admin_router.callback_query(F.data == "admin:toggle_news")
-async def toggle_news(callback: CallbackQuery):
-    config["news_enabled"] = not config["news_enabled"]
-    save_config()
-    reschedule_jobs()
-    await callback.answer(f"Новости {'включены' if config['news_enabled'] else 'выключены'}")
-    await admin_settings(callback)
-
-@admin_router.callback_query(F.data == "admin:set_weather_time")
-async def set_weather_time(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_weather_time)
-    await callback.message.edit_text(
-        "Введи новое время погоды в формате <b>ЧЧ:ММ</b>\nПример: <code>07:30</code>",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-@admin_router.message(AdminStates.waiting_weather_time)
-async def process_weather_time(message: Message, state: FSMContext):
+@dp.message(F.text == "◀️ Назад")
+async def go_back(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    text = message.text.strip()
-    try:
-        h, m = map(int, text.split(":"))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError
-        config["weather_time"] = f"{h:02d}:{m:02d}"
-        save_config()
-        reschedule_jobs()
-        await state.clear()
-        await message.answer(f"✅ Время погоды изменено на {config['weather_time']}")
-        await message.answer("<b>⚙️ Настройки</b>", reply_markup=settings_kb())
-    except Exception:
-        await message.answer("Неверный формат. Пример: 08:00")
+    await state.set_state(AdminStates.menu)
+    await message.answer("🛠 Админ-панель", reply_markup=main_menu_kb())
 
-@admin_router.callback_query(F.data == "admin:set_news_interval")
-async def set_news_interval(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_news_interval)
-    await callback.message.edit_text(
-        "Введи интервал проверки новостей в <b>минутах</b> (от 5 до 180):\nПример: <code>20</code>",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-@admin_router.message(AdminStates.waiting_news_interval)
-async def process_news_interval(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        minutes = int(message.text.strip())
-        if not 5 <= minutes <= 180:
-            raise ValueError
-        config["news_interval_minutes"] = minutes
-        save_config()
-        reschedule_jobs()
-        await state.clear()
-        await message.answer(f"✅ Интервал новостей: {minutes} мин")
-        await message.answer("<b>⚙️ Настройки</b>", reply_markup=settings_kb())
-    except Exception:
-        await message.answer("Введи число от 5 до 180")
-
-@admin_router.callback_query(F.data == "admin:send_weather")
-async def admin_send_weather(callback: CallbackQuery):
-    await callback.answer("Отправляю погоду...")
-    await send_weather(manual=True)
-    await callback.message.answer("✅ Погода отправлена в канал")
-
-@admin_router.callback_query(F.data == "admin:force_news")
-async def admin_force_news(callback: CallbackQuery):
-    await callback.answer("Проверяю новости...")
-    await fetch_and_send_news(force=True)
-    await callback.message.answer("✅ Проверка новостей завершена")
-
-@admin_router.callback_query(F.data == "admin:stats")
-async def admin_stats(callback: CallbackQuery):
-    s = config["stats"]
-    text = (
-        f"<b>📊 Статистика</b>\n\n"
-        f"🌤 Погоды отправлено: <b>{s['weather_sent']}</b>\n"
-        f"📰 Новостей отправлено: <b>{s['news_sent']}</b>\n\n"
-        f"Последняя погода: {s['last_weather'] or '—'}\n"
-        f"Последняя проверка новостей: {s['last_news_check'] or '—'}\n\n"
-        f"Источников: {len(config['rss_feeds'])}\n"
-        f"Погода: {'✅' if config['weather_enabled'] else '❌'}\n"
-        f"Новости: {'✅' if config['news_enabled'] else '❌'}"
-    )
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
-        ])
-    )
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:errors")
-async def admin_errors(callback: CallbackQuery):
-    errors = config.get("error_log", [])
-    if not errors:
-        text = "<b>📋 Логи ошибок</b>\n\nОшибок пока нет 🎉"
-    else:
-        text = "<b>📋 Последние ошибки</b>\n\n"
-        for err in reversed(errors[-10:]):
-            text += (
-                f"<b>{err['time']}</b>\n"
-                f"📍 {err['place']}\n"
-                f"<code>{err['error']}</code>\n"
-                f"────────────\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Очистить логи", callback_data="admin:clear_errors")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
-        ])
-    )
-    await callback.answer()
-
-@admin_router.callback_query(F.data == "admin:clear_errors")
-async def admin_clear_errors(callback: CallbackQuery):
-    config["error_log"] = []
-    save_config()
-    await callback.answer("Логи очищены")
-    await admin_errors(callback)
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "Привет, админ!\nИспользуй /admin для панели управления.",
-            reply_markup=admin_main_kb()
-        )
-    else:
-        await message.answer("Бот работает только в канале. Админ-команды недоступны.")
-
+# Запуск
 async def main():
     load_config()
+    load_pending()
+    load_seen()
     reschedule_jobs()
     scheduler.start()
-    dp.include_router(admin_router)
-    logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    logger.info("🚀 Бот запущен")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_http_client()
+        scheduler.shutdown()
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
+EOF
+
+# Замена токенов
+sed -i "s/REPLACE_BOT_TOKEN/$BOT_TOKEN/g" bot.py
+sed -i "s/REPLACE_CHANNEL_ID/$CHANNEL_ID/g" bot.py
+sed -i "s/REPLACE_ADMIN_ID/$ADMIN_ID/g" bot.py
+sed -i "s/REPLACE_OPENROUTER_KEY/$OPENROUTER_KEY/g" bot.py
+sed -i "s/REPLACE_OPENROUTER_MODEL/$AI_MODEL/g" bot.py
+
+echo "✅ bot.py создан"
+
+# Systemd
+echo "[4/6] Настройка systemd..."
+cat > /etc/systemd/system/belgorod-bot.service << EOF
+[Unit]
+Description=Belgorod News Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+Environment=PATH=$INSTALL_DIR/venv/bin
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/bot.py
+Restart=always
+RestartSec=10
+MemoryMax=256M
+CPUQuota=30%
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable belgorod-bot
+systemctl start belgorod-bot
+
+echo "[5/6] Проверка..."
+sleep 3
+systemctl status belgorod-bot --no-pager
+
+echo "[6/6] Завершение..."
+echo ""
+echo "========================================"
+echo "  ✅ УСТАНОВКА ЗАВЕРШЕНА!"
+echo "========================================"
+echo ""
+echo "📋 Команды:"
+echo "  sudo systemctl status belgorod-bot"
+echo "  sudo journalctl -u belgorod-bot -f"
+echo ""
+echo "📱 Напиши боту /admin"
+echo ""
+echo "📝 Лог: $LOG_FILE"
+echo "========================================"
